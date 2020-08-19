@@ -1,7 +1,8 @@
 from __future__ import print_function, division
 
-from keras.layers import Input, Dense, Reshape, Flatten, MaxPooling2D
-from keras.layers.advanced_activations import LeakyReLU
+from keras import backend
+from keras.layers import Input, Dense, Reshape, Flatten, BatchNormalization, Dropout
+from keras.layers.advanced_activations import ReLU
 from keras.layers.convolutional import Conv2DTranspose, Conv2D
 from keras.preprocessing.image import load_img
 from keras.preprocessing.image import img_to_array
@@ -19,7 +20,7 @@ import numpy as np
 import os
 from time import localtime, strftime
 
-NUM_OF_EPOCHS = 30
+NUM_OF_EPOCHS = 5
 DEBUG = 1
 
 
@@ -62,17 +63,33 @@ class DataLoader():
         self.path = glob('src\\datasets\\%s\\%sx%s\\*.jpg' % (self.dataset_name, self.img_res[0], self.img_res[1]))
         self.no_of_files = len(self.path)
 
-    def load_data(self, img_size, batch_size=1, is_testing=False):
+    def load_data(self, img_size, batch_size=1):
+        '''
+        Loads images and adds a noise to them.
+        '''
+
         imgs = []
+        # mean, var = 0, 0.1
+        # sigma = var ** 0.5
 
         batch_images = np.random.choice(self.path, size=batch_size)
 
         for img_path in batch_images:
-            img = np.array(img_to_array(load_img(img_path, target_size=img_size)) / 255.0)
+            # Creating noise
+            # gauss = np.random.normal(mean, sigma, img_size)
+
+            # Rescaling the image from [0.,255.] to [0.,1.]
+            #img = np.array(img_to_array(load_img(img_path, target_size=img_size))).astype(np.float32) / 255.
+
+            # Rescaling the image from [0.,255.] to [-1.,1.]
+            img = (np.array(img_to_array(load_img(img_path, target_size=img_size))).astype(np.float32) - 127.5) / 127.5
+
+            # Adding noise
+            # imgs.append(img + gauss)
             imgs.append(img)
 
-        imgs = np.array(imgs).astype(np.float32)
-        return imgs
+        return np.array(imgs)
+
 
     def get_img_number(self):
         return self.no_of_files
@@ -87,10 +104,10 @@ class DCGAN():
         self.time = strftime('%m%d_%H%M', localtime())
         self.dataset_name = 'CelebA'
 
-        optimizer = Adam(learning_rate=1e-4, beta_1=0.5)
+        optimizer = Adam(learning_rate=5e-5, beta_1=0.5)
 
-        self.gf = 128  # filter size of generator's last layer
-        self.df = 32  # filter size of discriminator's first layer
+        self.gf = 64  # filter size of generator's last layer
+        self.df = 64  # filter size of discriminator's first layer
 
         # Configure data loader
         self.data_loader = DataLoader(dataset_name=self.dataset_name, img_res=(self.img_size, self.img_size))
@@ -128,7 +145,7 @@ class DCGAN():
         self.combined = Model(z, validity)
         print("\n---------------------combined summary----------------------------")
         self.combined.summary()
-        self.combined.compile(loss=['binary_crossentropy'],
+        self.combined.compile(loss='binary_crossentropy',
                               optimizer=optimizer)
 
 
@@ -137,89 +154,45 @@ class DCGAN():
 
 
     def build_generator(self):
-        '''
-        # Another architecture taken from internet
-        ## latent variable as input
-        input_noise = Input(shape=(self.latent_dim,))
-        d = Dense(1024, activation="relu")(input_noise)
-        d = Dense(128 * 8 * 8, activation="relu")(d)
-        d = Reshape((8, 8, 128))(d)
 
-        d = Conv2DTranspose(128, kernel_size=(2, 2), strides=(2, 2), use_bias=False)(d)
-        d = Conv2D(64, (1, 1), activation='relu', padding='same', name="block_4")(d)  ## 16,16
+        def g_dense_block(layer_input, shape):
+            g = Dense(shape, activation='relu')(layer_input)
+            return BatchNormalization(momentum=0.2)(g)
 
-        d = Conv2DTranspose(32, kernel_size=(2, 2), strides=(2, 2), use_bias=False)(d)
-        d = Conv2D(64, (1, 1), activation='relu', padding='same', name="block_5")(d)  ## 32,32
-
-        if self.img_size == 64:
-            d = Conv2DTranspose(32, kernel_size=(2, 2), strides=(2, 2), use_bias=False)(d)
-            d = Conv2D(64, (1, 1), activation='relu', padding='same', name="block_6")(d)  ## 64,64
-
-        img = Conv2D(3, (1, 1), activation='sigmoid', padding='same', name="final_block")(d)  ## 32, 32
-        return Model(input_noise, img)
-        '''
-
-        def g_block(layer_input, filters, strides=(2, 2)):
-            """Generator layer"""
-            g = Conv2DTranspose(filters, kernel_size=(3, 3), strides=strides, padding='same')(layer_input)
-            g = LeakyReLU(0.2)(g)
-            g = Conv2D(self.gf, (1, 1), padding='same')(g)
-            return LeakyReLU(0.2)(g)
+        def g_conv_block(layer_input, filters, strides=(2, 2)):
+            g = Conv2DTranspose(filters, kernel_size=(3, 3), strides=strides, padding='same', activation='relu')(layer_input)
+            g = Conv2D(self.gf, (3, 3), padding='same', activation='relu')(g)
+            return BatchNormalization(momentum=0.2)(g)
 
         noise = Input(shape=(self.latent_dim,))
 
-        g = Dense(self.img_size // 8 * self.img_size // 8 * self.gf * 8)(noise)
-        g = LeakyReLU(alpha=0.2)(g)
-        g = Reshape((self.img_size // 8, self.img_size // 8, self.gf * 8))(g)
-        g = LeakyReLU(alpha=0.2)(g)
+        #g = g_dense_block(noise, int(self.img_size // 32) * int(self.img_size // 32) * self.gf * 8)
+        g = g_dense_block(noise, int(self.img_size // 16) * int(self.img_size // 16) * self.gf * 8)
+        g = g_dense_block(g, int(self.img_size // 8) * int(self.img_size // 8) * self.gf * 8)
+        g = Reshape((int(self.img_size // 8), int(self.img_size // 8), self.gf * 8))(g)
 
-        g = g_block(g, self.gf * 8)
-        g = g_block(g, self.gf * 2)
-        g = g_block(g, self.gf)
+        g = g_conv_block(g, self.gf * 8)
+        g = g_conv_block(g, self.gf * 2)
+        g = g_conv_block(g, self.gf)
 
-        gen_img = Conv2D(self.channels, kernel_size=(1, 1), padding='same', activation='sigmoid')(g)
+        gen_img = Conv2D(self.channels, kernel_size=(1, 1), padding='same', activation='tanh')(g)
 
         return Model(noise, gen_img)
 
 
     def build_discriminator(self):
-        '''
-        # Another architecture taken from internet
-        input_img = Input(shape=(self.img_size, self.img_size, self.channels))
-
-        x = Conv2D(32, (3, 3), activation='relu', padding='same', name='block1_conv1')(input_img)
-        x = Conv2D(32, (3, 3), activation='relu', padding='same', name='block1_conv2')(x)
-        x = MaxPooling2D((2, 2), strides=(2, 2), name='block1_pool')(x)
-
-        x = Conv2D(64, (3, 3), activation='relu', padding='same', name='block2_conv1')(x)
-        x = Conv2D(64, (3, 3), activation='relu', padding='same', name='block2_conv2')(x)
-        x = MaxPooling2D((2, 2), strides=(2, 2), name='block2_pool')(x)
-
-        x = Conv2D(128, (3, 3), activation='relu', padding='same', name='block4_conv1')(x)
-        x = Conv2D(128, (3, 3), activation='relu', padding='same', name='block4_conv2')(x)
-        x = MaxPooling2D((2, 2), strides=(1, 1), name='block4_pool')(x)
-
-        x = Flatten()(x)
-        x = Dense(1024, activation='relu')(x)
-        out = Dense(1, activation='sigmoid')(x)
-        return Model(input_img, out)
-        '''
-
-        def d_block(layer_input, filters, strides=(2, 2)):
-            """Discriminator layer"""
-            d = Conv2D(filters, kernel_size=(3, 3), strides=strides, padding='same')(layer_input)
-            return LeakyReLU(alpha=0.2)(d)
 
         # Input img = generated image
         img = Input(shape=(self.img_size, self.img_size, self.channels))
 
-        d = d_block(img, self.df)
-        d = d_block(d, self.df * 2)
-        d = d_block(d, self.df * 4)
+        d = Conv2D(self.df, kernel_size=(3, 3), strides=(2, 2), padding='same', activation='relu')(img)
+        d = Conv2D(self.df * 2, kernel_size=(3, 3), strides=(2, 2), padding='same', activation='relu')(d)
+        d = Conv2D(self.df * 4, kernel_size=(3, 3), strides=(2, 2), padding='same', activation='relu')(d)
 
         d = Flatten()(d)
         d = Dense(1024)(d)
-        d = LeakyReLU(0.2)(d)
+        d = ReLU()(d)
+        d = Dropout(0.2)(d)
         validity = Dense(1, activation='sigmoid')(d)
 
         return Model(img, validity)
@@ -251,7 +224,7 @@ class DCGAN():
             for iter in range(max_iter):
 
                 # Creating two batches with reference and fake images
-                ref_imgs = self.data_loader.load_data((self.img_size, self.img_size), half_batch)
+                ref_imgs = self.data_loader.load_data((self.img_size, self.img_size), batch_size)
 
                 # Select a random half batch of images
                 idx = np.random.randint(0, ref_imgs.shape[0], half_batch)
@@ -299,7 +272,7 @@ class DCGAN():
         #print(f'generated image {gen_imgs[0]}')
 
         # Rescale images 0 - 1
-        #gen_imgs = (1/2.5) * gen_imgs + 0.5
+        gen_imgs = (1/2.5) * gen_imgs + 0.5
         #print(f'normalized image {gen_imgs[0]}')
 
         # Save generated images and the high resolution originals
