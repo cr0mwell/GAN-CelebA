@@ -1,4 +1,4 @@
-from GANtest.base import GAN, set_configuration, plot_history
+from .base import GAN, set_configuration, plot_history
 
 from keras import backend
 from keras.constraints import Constraint
@@ -13,11 +13,11 @@ import datetime
 import numpy as np
 import os
 
-NUM_OF_EPOCHS = 5
+NUM_OF_EPOCHS = 30
 BATCH_SIZE = 50
 SAMPLE_INTERVAL = 200
 D_TRAIN_ITERATIONS = 5
-DEBUG = 1
+DEBUG = 0
 
 
 # implementation of Wasserstein loss

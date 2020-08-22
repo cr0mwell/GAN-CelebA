@@ -1,4 +1,4 @@
-from GANtest.base import GAN, set_configuration, plot_history
+from .base import GAN, set_configuration, plot_history
 
 from keras.layers import Input, Dense, Reshape, Flatten, BatchNormalization, Dropout
 from keras.layers.advanced_activations import LeakyReLU
@@ -11,10 +11,10 @@ import datetime
 import numpy as np
 import os
 
-NUM_OF_EPOCHS = 100
+NUM_OF_EPOCHS = 30
 BATCH_SIZE = 50
 SAMPLE_INTERVAL = 200
-DEBUG = 1
+DEBUG = 0
 
 
 class DCGAN(GAN):
