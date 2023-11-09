@@ -1,162 +1,203 @@
-from .base import GAN, set_configuration, plot_history
+from base import GAN, get_datasets, step
+from constants import (SEP, BATCH_SIZE, EPOCHS, ADAM_MOMENTUM, MODELS_DIR)
 
-from keras.layers import Input, Dense, Reshape, Flatten, BatchNormalization, Dropout
-from keras.layers.advanced_activations import LeakyReLU
-from keras.layers.convolutional import Conv2DTranspose, Conv2D
-from keras.models import Model
-from keras.optimizers import Adam
-from keras.callbacks import TensorBoard
+from argparse import ArgumentParser, BooleanOptionalAction
 
-import datetime
-import numpy as np
-import os
-
-NUM_OF_EPOCHS = 30
-BATCH_SIZE = 50
-SAMPLE_INTERVAL = 200
-DEBUG = 0
+import tensorflow as tf
+from tensorflow.keras.layers import (Dense, Reshape, Flatten, BatchNormalization, Dropout, GlobalAveragePooling2D,
+                                     Conv2DTranspose, Conv2D, ReLU, LeakyReLU, Rescaling, Resizing, Lambda, Activation)
+from tensorflow.keras import Input, Model
 
 
 class DCGAN(GAN):
 
+    def compile(self, generator_optimizer, discriminator_optimizer, **kwargs):
+        super().compile(generator_optimizer, discriminator_optimizer, **kwargs)
+
+        self.generator_loss_tracker = tf.keras.metrics.Mean(name="g_loss")
+        self.discriminator_loss_tracker = tf.keras.metrics.Mean(name="d_loss")
+        self.real_accuracy = tf.keras.metrics.BinaryAccuracy(name="accuracy")
+
+    @property
+    def metrics(self):
+        return [
+            self.generator_loss_tracker,
+            self.discriminator_loss_tracker,
+            self.augmentation_probability_tracker,
+            self.real_accuracy,
+            self.kid,
+        ]
+
+    def adversarial_loss(self, real_logits, generated_logits):
+        # this is usually called the non-saturating GAN loss
+
+        real_labels = tf.ones(shape=(self.batch_size, 1))
+        generated_labels = tf.zeros(shape=(self.batch_size, 1))
+
+        # the generator tries to produce images that the discriminator considers as real
+        generator_loss = tf.keras.losses.binary_crossentropy(real_labels, generated_logits, from_logits=True)
+        # the discriminator tries to determine if images are real or generated
+        discriminator_loss = tf.keras.losses.binary_crossentropy(
+            tf.concat([real_labels, generated_labels], axis=0),
+            tf.concat([real_logits, generated_logits], axis=0),
+            from_logits=True
+            )
+
+        return tf.reduce_mean(generator_loss), tf.reduce_mean(discriminator_loss)
+
+    def train_step(self, real_images):
+        real_images = self.augmenter(real_images, self.batch_size, training=True)
+
+        # Training the discriminator 2 steps and generator 1 step
+        for _ in range(self.d_steps):
+            # use persistent gradient tape because gradients will be calculated twice
+            with tf.GradientTape(persistent=True) as tape:
+
+                generated_images = self.generate(self.batch_size, training=True)
+                # gradient is calculated through the image augmentation
+                generated_images = self.augmenter(generated_images, self.batch_size, training=True)
+
+                # separate forward passes for the real and generated images, meaning
+                # that batch normalization is applied separately
+                real_logits = self.discriminator(real_images, training=True)
+                generated_logits = self.discriminator(generated_images, training=True)
+
+                generator_loss, discriminator_loss = self.adversarial_loss(
+                    real_logits, generated_logits
+                )
+
+            # calculate gradients and update weights for generator
+            discriminator_gradients = tape.gradient(
+                discriminator_loss, self.discriminator.trainable_weights
+            )
+
+            self.discriminator_optimizer.apply_gradients(
+                zip(discriminator_gradients, self.discriminator.trainable_weights)
+            )
+
+        # calculate gradients and update weights for generator
+        generator_gradients = tape.gradient(
+            generator_loss, self.generator.trainable_weights
+        )
+
+        self.generator_optimizer.apply_gradients(
+            zip(generator_gradients, self.generator.trainable_weights)
+        )
+
+        # update the augmentation probability based on the discriminator's performance
+        self.augmenter.update(real_logits)
+        self.generator_loss_tracker.update_state(generator_loss)
+        self.discriminator_loss_tracker.update_state(discriminator_loss)
+        self.real_accuracy.update_state(1.0, step(real_logits))
+        self.augmentation_probability_tracker.update_state(self.augmenter.probability)
+
+        # track the exponential moving average of the generator's weights to decrease
+        # variance in the generation quality
+        for weight, ema_weight in zip(self.generator.weights, self.ema_generator.weights):
+            ema_weight.assign(self.ema * ema_weight + (1 - self.ema) * weight)
+
+        # KID is not measured during the training phase for computational efficiency
+        return {m.name: m.result() for m in self.metrics[:-1]}
+
     def build_generator(self):
-
         def g_dense_block(layer_input, shape):
-            g = Dense(shape)(layer_input)
-            g = LeakyReLU(0.2)(g)
-            return BatchNormalization(momentum=0.2)(g)
+            g = Dense(shape, use_bias=False)(layer_input)
+            g = BatchNormalization(scale=False)(g)
+            return LeakyReLU(0.2)(g)
 
-        def g_conv_block(layer_input, filters, strides=(2, 2)):
-            g = Conv2DTranspose(filters, kernel_size=(3, 3), strides=strides, padding='same')(layer_input)
-            g = LeakyReLU(0.2)(g)
-            g = Conv2D(self.gf, (3, 3), padding='same')(g)
-            g = LeakyReLU(0.2)(g)
-            g = Dropout(0.2)(g)
-            return BatchNormalization(momentum=0.2)(g)
+        def g_tconv_block(layer_input, mul):
+            g = Conv2DTranspose(self.filters * mul,
+                                kernel_size=4,
+                                strides=2,
+                                padding='same',
+                                use_bias=False)(layer_input)
+            g = BatchNormalization(scale=False)(g)
+            return LeakyReLU(0.2)(g)
 
         noise = Input(shape=(self.latent_dim,))
 
-        # My graphics card RAM amount wasn't enough to support more layers
-        #g = g_dense_block(noise, int(self.img_size // 32) * int(self.img_size // 32) * self.gf * 8)
-        g = g_dense_block(noise, int(self.img_size // 16) * int(self.img_size // 16) * self.gf * 8)
-        g = g_dense_block(g, int(self.img_size // 8) * int(self.img_size // 8) * self.gf * 8)
-        g = Reshape((int(self.img_size // 8), int(self.img_size // 8), self.gf * 8))(g)
+        g = g_dense_block(noise, 8 * 8 * self.filters * 4)
 
-        g = g_conv_block(g, self.gf * 8)
-        g = g_conv_block(g, self.gf * 2)
-        g = g_conv_block(g, self.gf)
+        g = Reshape((8, 8, self.filters * 4))(g)
 
-        gen_img = Conv2D(self.channels, kernel_size=(1, 1), padding='same', activation='tanh')(g)
+        for i in [2, 1]:
+            g = g_tconv_block(g, i)
 
-        return Model(noise, gen_img)
+        gen_img = Conv2DTranspose(3, kernel_size=4, strides=2, padding='same', activation='tanh', dtype='float32')(g)
 
+        return Model(noise, gen_img, name=f'Generator_{self.model_name}')
 
     def build_discriminator(self):
-
-        def d_conv_block(layer_input, filters):
-            d = Conv2D(filters, kernel_size=(3, 3), strides=(2, 2), padding='same')(layer_input)
+        def d_conv_block(layer_input, mul):
+            d = Conv2D(self.filters * mul, kernel_size=4, strides=2, padding='same', use_bias=False)(layer_input)
+            d = BatchNormalization(scale=False)(d)
             return LeakyReLU(0.2)(d)
 
         # Input img = generated image
-        img = Input(shape=(self.img_size, self.img_size, self.channels))
+        img = Input(shape=(self.img_size, self.img_size, 3))
 
-        d = d_conv_block(img, self.df)
-        d = d_conv_block(d, self.df * 2)
-        d = d_conv_block(d, self.df * 4)
+        d = d_conv_block(img, 1)
+
+        for i in [2, 4]:
+            d = d_conv_block(d, i)
 
         d = Flatten()(d)
-        d = Dense(1024)(d)
-        d = LeakyReLU(0.2)(d)
-        d = Dropout(0.2)(d)
-        validity = Dense(1, activation='sigmoid')(d)
+        d = Dropout(self.dropout_val)(d)
+        validity = Dense(1, dtype='float32')(d)
 
-        return Model(img, validity)
-
-
-    def train(self, epochs, batch_size, sample_interval):
-        def named_logs(model, logs):
-            result = {}
-            for l in zip(model.metrics_names, logs):
-                result[l[0]] = l[1]
-            return result
-
-        start_time = datetime.datetime.now()
-
-        half_batch = int(batch_size / 2) or 1
-
-        max_iter = int(self.n_data/batch_size)
-        os.makedirs(f'.\\logs\\{self.time}', exist_ok=True)
-        tensorboard = TensorBoard(f'.\\logs\\{self.time}')
-        tensorboard.set_model(self.generator)
-
-        os.makedirs(f'src\\models\\{self.time}', exist_ok=True)
-        with open(f'src\\models\\{self.time}\\generator_architecture.json', 'w') as f:
-            f.write(self.generator.to_json())
-        print(f'\nbatch size : {batch_size} | num_data : {self.n_data} | max iteration : {max_iter} | time : {self.time} \n')
-
-        for epoch in range(self.last_epoch+1, self.last_epoch+epochs+1):
-            for i in range(max_iter):
-
-                # Creating two batches with reference and fake images
-                ref_imgs = self.data_loader.load_data(batch_size)
-
-                # Select a random half batch of images
-                idx = np.random.randint(0, ref_imgs.shape[0], half_batch)
-                ref_imgs = ref_imgs[idx]
-                noise = np.random.normal(0, 1, (half_batch, self.latent_dim))
-                gen_imgs = self.generator.predict(noise)
-
-                # ---------------------
-                #  Train Discriminator
-                # ---------------------
-                d_loss_real = self.discriminator.train_on_batch(ref_imgs, np.ones((half_batch, 1)))
-                d_loss_fake = self.discriminator.train_on_batch(gen_imgs, np.zeros((half_batch, 1)))
-                d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
-
-                # ---------------------
-                #  Train Generator
-                # ---------------------
-                noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-
-                # Generator wants to see its images as real
-                g_loss = self.combined.train_on_batch(noise, np.ones((batch_size, 1)))
-
-                # Logging messages and saving generated images
-                tensorboard.on_epoch_end(i, named_logs(self.combined, [g_loss]))
-
-                self.history.append({'D': d_loss[0], 'G': g_loss})
-
-                if i % (sample_interval // 10) == 0:
-                    elapsed_time = datetime.datetime.now() - start_time
-                    print(f'epoch:{epoch} | iter : {i} / {max_iter} | time : {str(elapsed_time):10s} | '
-                          f'g_loss : {g_loss:4.3f} | d_loss : {d_loss[0]:4.3f} | acc : {100*d_loss[1]:.3f}')
-
-                if (i+1) % sample_interval == 0:
-                    self.sample_images(epoch, i+1)
-
-            self.last_epoch += 1
-
-            # Saving models weights and loss history every 10 epochs
-            if epoch % 10 == 0:
-                self.save_model()
-
-        # save the models weights and the loss history at the end
-        self.save_model()
+        return Model(img, validity, name=f'Discriminator_{self.model_name}')
 
 
 if __name__ == '__main__':
 
-    set_configuration()
-    optimizer = Adam(learning_rate=5e-5, beta_1=0.5)
-    gan = DCGAN(loss='binary_crossentropy',
-                optimizer=optimizer,
-                metrics=['accuracy'],
-                start_time=None,
-                last_epoch=None)
+    parser = ArgumentParser(prog='Deep Convolutional GAN',
+                            description='Model generates 25 human faces in test mode.')
+    parser.add_argument('-t', action=BooleanOptionalAction, help='Flag for the train mode')
+    parser.add_argument('-e', type=int, default=EPOCHS, help='Number of epochs to train')
+    parser.add_argument('-b', type=int, default=BATCH_SIZE,
+                        help='Batch size. Please mind the memory limits of your system.')
+    parser.add_argument('-o', type=str, choices=['adam', 'rmsprop'], default='adam',
+                        help='Optimizer. One of the following: ["adam", "rmsprop"]')
+    args = parser.parse_args()
 
-    if DEBUG == 1:
-        gan.train(epochs=2, batch_size=BATCH_SIZE, sample_interval=SAMPLE_INTERVAL)
+    # Creating datasets
+    train_ds, test_ds = get_datasets(args.b)
+
+    if args.o == 'adam':
+        optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=2e-4, beta_1=ADAM_MOMENTUM)
     else:
-        gan.train(epochs=NUM_OF_EPOCHS, batch_size=BATCH_SIZE, sample_interval=SAMPLE_INTERVAL)
+        optimizer = tf.keras.optimizers.legacy.RMSprop(learning_rate=5e-5)
 
-    plot_history(gan.history, gan.time)
+    model = DCGAN(model_name='DC_GAN', batch_size=args.b)
+    model.compile(generator_optimizer=optimizer, discriminator_optimizer=optimizer)
+
+    # Save the best model based on the validation KID metric
+    checkpoint_path = f'{MODELS_DIR}{SEP}{model.model_name}{SEP}{model.model_name}.ckpt'
+
+    if args.t:
+        checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_path,
+            save_weights_only=True,
+            monitor="val_kid",
+            mode="auto",
+            save_best_only=True,
+            save_freq='epoch',
+            verbose=1
+        )
+
+        # Training the model
+        model.fit(
+            train_ds,
+            epochs=args.e,
+            validation_data=test_ds,
+            callbacks=[
+                tf.keras.callbacks.LambdaCallback(on_epoch_begin=model.update_epoch,
+                                                  on_epoch_end=model.save_model_and_history,
+                                                  on_batch_end=model.update_sample_images_and_history),
+                checkpoint_callback,
+                ],
+            )
+
+    else:
+        model.load_weights(checkpoint_path).expect_partial()
+        model.sample_images()
